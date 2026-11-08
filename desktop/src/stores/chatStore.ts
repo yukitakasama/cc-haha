@@ -9,7 +9,7 @@ import { create } from 'zustand'
 import { boundActivityText, CHAT_TERMINAL_ACTIVITY_MAX_PER_SESSION, CHAT_TERMINAL_ACTIVITY_MAX_TOTAL } from '../lib/chatHistoryBudget'
 import { wsManager } from '../api/websocket'
 import { sessionsApi, type SessionHistoryPage } from '../api/sessions'
-import { ApiResponseParseError } from '../api/client'
+import { ApiError, ApiResponseParseError } from '../api/client'
 import { subagentsApi } from '../api/subagents'
 import { useTeamPlanStore } from './teamPlanStore'
 import { useTeamStore } from './teamStore'
@@ -77,6 +77,20 @@ function reconcileProviderRuntimeSelection(sessionId: string, selection: Runtime
     currentModelId: settings.currentModel?.id,
     defaultEffortLevel: settings.effortLevel,
   })
+}
+
+/**
+ * A member message the server turned down. A slash command the member's CLI
+ * may not run (`/clear`, `/model`) gets the desktop's own localized words,
+ * which point at `/compact` and the model picker; anything else keeps the
+ * server's message.
+ */
+function teamMemberMessageFailure(err: unknown): string {
+  const body = err instanceof ApiError ? err.body : undefined
+  if (body && typeof body === 'object' && (body as { error?: unknown }).error === 'MEMBER_COMMAND_UNSUPPORTED') {
+    return t('teams.memberCommandUnsupported')
+  }
+  return err instanceof Error ? err.message : String(err)
 }
 type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
 type CompactSummaryMessage = Extract<UIMessage, { type: 'compact_summary' }>
@@ -248,6 +262,11 @@ export type PerSessionState = {
   composerDraft?: ComposerDraftState | null
   repositoryLaunchDraft?: RepositoryLaunchDraftState | null
   queuedUserMessages?: QueuedUserMessage[]
+  /**
+   * Predicted next prompt for the empty composer (`prompt_suggestion`). In
+   * memory only; cleared when the user sends or the next turn starts.
+   */
+  promptSuggestion?: string | null
 }
 
 const DEFAULT_SESSION_STATE: PerSessionState = {
@@ -296,6 +315,7 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   composerDraft: null,
   repositoryLaunchDraft: null,
   queuedUserMessages: [],
+  promptSuggestion: null,
 }
 
 export function createDefaultSessionState(): PerSessionState {
@@ -519,6 +539,7 @@ type ChatStore = {
   removeQueuedUserMessage: (sessionId: string, messageId: string) => void
   sendQueuedUserMessage: (sessionId: string, messageId: string) => void
   clearMessages: (sessionId: string) => void
+  dismissPromptSuggestion: (sessionId: string) => void
   handleServerMessage: (sessionId: string, msg: ServerMessage) => void
 }
 
@@ -3592,6 +3613,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             pendingBackgroundContinue: [],
             backgroundContinueNoticeId: undefined,
             isPreparingTurn: false,
+            promptSuggestion: null,
             historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
             elapsedSeconds: 0,
             replaceHistoryOnCompletion: false,
@@ -3618,7 +3640,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
                 {
                   id: nextId(),
                   type: 'error',
-                  message: err instanceof Error ? err.message : String(err),
+                  message: teamMemberMessageFailure(err),
                   code: 'TEAM_MEMBER_MESSAGE_FAILED',
                   timestamp: Date.now(),
                 },
@@ -3761,8 +3783,9 @@ export const useChatStore = create<ChatStore>((setState, get) => {
   },
 
   setSessionPermissionMode: (sessionId, mode) => {
-    const session = get().sessions[sessionId]
-    if (!session || session.chatState !== 'idle') return
+    // Allowed mid-turn: the server applies it to the running CLI, so tool calls
+    // after the switch use the new mode without interrupting the turn.
+    if (!get().sessions[sessionId]) return
     wsManager.send(sessionId, { type: 'set_permission_mode', mode })
   },
 
@@ -3804,6 +3827,7 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             ...session,
             messages: markPendingToolUseMessagesStopped(stoppedMessages),
             chatState: 'idle',
+            promptSuggestion: null,
             activeToolUseId: null,
             activeToolName: null,
             activeThinkingId: null,
@@ -4837,7 +4861,13 @@ export const useChatStore = create<ChatStore>((setState, get) => {
       queuedUserMessages: [],
       pendingBackgroundContinue: [],
       backgroundContinueNoticeId: undefined,
+      promptSuggestion: null,
     })) }))
+  },
+
+  dismissPromptSuggestion: (sessionId) => {
+    if (!get().sessions[sessionId]?.promptSuggestion) return
+    set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, () => ({ promptSuggestion: null })) }))
   },
 
   handleServerMessage: (sessionId, msg) => {
@@ -5156,6 +5186,8 @@ export const useChatStore = create<ChatStore>((setState, get) => {
                 : '',
             ...(msg.state === 'idle' ? { activeThinkingId: null } : {}),
             ...(msg.state === 'idle' ? { apiRetry: null, streamingFallback: null } : {}),
+            // Any new model activity makes the previous turn's prediction stale.
+            ...(msg.state !== 'idle' && session.promptSuggestion ? { promptSuggestion: null } : {}),
             ...(msg.attemptStart ? {
               streamAttemptStartIndex: session.messages.length,
               streamAttemptStartResponseChars: session.streamingResponseChars,
@@ -5854,6 +5886,10 @@ export const useChatStore = create<ChatStore>((setState, get) => {
             replaceHistoryOnCompletion: false,
             stopAllSubagentsRequested: false,
             historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
+            // Another client (phone, IM, a second window) started a turn: only
+            // its own socket gets the thinking status, so drop the stale
+            // prediction here rather than at the first streamed event.
+            promptSuggestion: null,
           }
         })
         break
@@ -5979,6 +6015,14 @@ export const useChatStore = create<ChatStore>((setState, get) => {
         break
       case 'task_update':
         break
+      case 'prompt_suggestion': {
+        const session = get().sessions[sessionId]
+        // A late prediction for a turn the user already moved past is stale.
+        if (!session || session.chatState !== 'idle' || session.queuedUserMessages?.length) break
+        if (session.promptSuggestion === msg.suggestion) break
+        update(() => ({ promptSuggestion: msg.suggestion }))
+        break
+      }
       case 'session_title_updated':
         useSessionStore.getState().updateSessionTitle(msg.sessionId, msg.title)
         useTabStore.getState().updateTabTitle(msg.sessionId, msg.title)

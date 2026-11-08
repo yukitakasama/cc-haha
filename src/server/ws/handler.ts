@@ -601,7 +601,7 @@ export type LiveSessionActivity = {
 
 /** Power safety uses work ownership, never the visual Stop/failed projection. */
 export function hasSessionPowerActivity(): boolean {
-  if (conversationService.hasPendingTeamStops()) return true
+  if (conversationService.hasPendingTeamStops() || conversationService.hasPromptSuggestionPowerActivity()) return true
   const ids = new Set([
     ...conversationService.getActiveSessions(), ...activeUserTurns.keys(),
     ...activeCliRuns, ...legacyQueuedSessionChats, ...activeBackgroundTaskIds.keys(),
@@ -785,7 +785,8 @@ function translateCliUsage(usage: unknown): TokenUsage {
 export type WebSocketData = {
   sessionId: string
   connectedAt: number
-  channel: 'client' | 'sdk'
+  /** `p2p` is the desktop WebRTC endpoint's relay link; index.ts routes it to the P2P broker. */
+  channel: 'client' | 'sdk' | 'p2p'
   clientKind?: 'full' | 'pet'
   /** Only a machine-token authenticated local socket may take over an IM lease. */
   powerActivityLeaseAuthorized?: boolean
@@ -794,6 +795,12 @@ export type WebSocketData = {
   serverHost: string
   /** The client fetches tool-result images by reference (`?media=ref`). */
   mediaRefs?: boolean
+  /** The client shows next-prompt suggestions in its composer (`?suggestions=1`). */
+  promptSuggestions?: boolean
+  /** The client opted into a resumable stream (see resumableStreams.ts). */
+  resume?: import('./resumableStreams.js').ResumeRequest
+  /** This socket's close must end its resumable stream (revoke, origin change, user disable). */
+  terminal?: boolean
 }
 
 // Active WebSocket clients, grouped by session. Desktop, H5, and IM adapters can
@@ -2291,16 +2298,16 @@ async function applyPermissionModeToActiveSession(
   sessionId: string,
   mode: PermissionMode,
 ): Promise<void> {
+  // The latest choice wins over a restart still waiting for the turn to end.
+  deferredPermissionModes.delete(sessionId)
   const currentMode = conversationService.getSessionPermissionMode(sessionId)
-  if (shouldDeferRuntimeRestartForActiveTurn(sessionId)) {
-    deferredPermissionModes.set(sessionId, mode)
-    return
-  }
-
   if (currentMode === mode) {
     sendToSession(sessionId, { type: 'permission_mode_changed', mode })
     return
   }
+  // The CLI applies set_permission_mode in-process, mid-turn included: tool
+  // calls after the switch are checked under the new mode, while a request the
+  // user is already looking at stays pending until they answer it.
   try {
     const ok = await conversationService.setPermissionMode(sessionId, mode)
     if (!ok) {
@@ -2310,6 +2317,11 @@ async function applyPermissionModeToActiveSession(
     await commitConfirmedPermissionMode(sessionId, mode)
   } catch (err) {
     if (!isSideChatId(sessionId) && shouldFallbackToPermissionRestart(mode, err)) {
+      // Only the legacy restart would end the running turn; let it finish first.
+      if (shouldDeferRuntimeRestartForActiveTurn(sessionId)) {
+        deferredPermissionModes.set(sessionId, mode)
+        return
+      }
       await restartSessionWithPermissionMode(ws, sessionId, mode)
       return
     }
@@ -4783,6 +4795,11 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
       return []
     }
 
+    case 'prompt_suggestion': {
+      const suggestion = typeof cliMsg.suggestion === 'string' ? cliMsg.suggestion.trim() : ''
+      return suggestion ? [{ type: 'prompt_suggestion', suggestion }] : []
+    }
+
     default:
       // 未知类型 — 调试输出但不转发
       console.log(`[WS] Unknown CLI message type: ${cliMsg.type}`, JSON.stringify(cliMsg).substring(0, 200))
@@ -5242,6 +5259,7 @@ function addActiveClient(
     activeSessions.set(sessionId, clients)
   }
   clients.add(ws)
+  syncPromptSuggestionClient(sessionId)
 }
 
 function removeActiveClient(
@@ -5254,7 +5272,14 @@ function removeActiveClient(
   if (clients.size === 0) {
     activeSessions.delete(sessionId)
   }
+  syncPromptSuggestionClient(sessionId)
   return true
+}
+
+function syncPromptSuggestionClient(sessionId: string): void {
+  const clients = activeSessions.get(sessionId)
+  const present = clients ? [...clients].some((client) => client.data.promptSuggestions === true) : false
+  conversationService.setPromptSuggestionClientPresent(sessionId, present)
 }
 
 function hasActiveClients(sessionId: string): boolean {
@@ -6046,6 +6071,7 @@ export function closeSessionConnection(sessionId: string, reason = 'session clos
   if (!clients || clients.size === 0) return false
 
   activeSessions.delete(sessionId)
+  syncPromptSuggestionClient(sessionId)
   for (const ws of clients) {
     if (activePetClient === ws) activePetClient = null
     clientOutputCallbacks.delete(ws)

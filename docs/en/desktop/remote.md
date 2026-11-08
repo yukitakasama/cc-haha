@@ -23,6 +23,8 @@ The mobile app works with desktop v0.7.6 or later. Its interface is currently Ch
 
 Keep the computer on, awake, and running cc-haha. Tasks always execute on the computer. Cloudflare Tunnel provides connectivity while away; the cc-haha mobile app and browser let you check tasks and respond to approvals.
 
+Approval, completion and error alerts after you leave the app need no setup on the computer. On iPhone, the Expo push service relays system notifications, so the computer must be able to reach `exp.host`. On Android, the persistent 「正在值守」 (on duty) notification keeps a direct connection to the computer without Google services; on Xiaomi, Huawei, OPPO, vivo and similar phones, also tap 「允许后台运行」 (allow background running) under the app's 设置 → 通知, and allow cc-haha to auto-start and stay locked in recent apps in the system settings.
+
 To chat from WeChat, DingTalk, WhatsApp, Telegram, or Feishu, see **IM Adapters** at the end of this page.
 
 ## H5 Access
@@ -127,9 +129,22 @@ The computer's proxy handles its connection to Cloudflare; it does not enable a 
 | Fixed domain fails | Whether DNS for the HTTPS hostname has taken effect, and whether the computer's network and proxy work |
 | Computer says ready but phone cannot open the entry | Test the hostname on cellular data, and confirm the computer is running, online, and awake |
 | An old quick address stops working after restart | Scan the new code on the desktop, or use a fixed domain to keep a long-lived address |
-| No system notification while backgrounded | The tunnel provides connectivity; background push needs separate configuration. Reopen the app to synchronize task state |
+| No system notification while backgrounded | Check that the app's 设置 → 通知 shows 「通知已就绪」 (ready). On iPhone, the computer must reach `exp.host`; on Android, the 「正在值守」 notification must be present and background running and auto-start allowed. Reopening the app registers and reconnects again |
 
 The official connector's data connection uses outbound port `7844`. Restricted networks or proxies may block it. Choosing HTTP/2 does not change that data connection to port `443`. See [Cloudflare connection troubleshooting](https://developers.cloudflare.com/tunnel/troubleshooting/).
+
+### Direct connections and coming back to the app
+
+The phone app connects through Cloudflare first, then tries to set up a **direct connection** (P2P) to the computer in the background. On the same Wi-Fi, or when the network allows it (for example when both ends have working IPv6), requests and sessions switch to the direct path, which is usually much faster than going around through Cloudflare. If no direct path works, the app simply stays on Cloudflare. There is nothing to configure. The chat menu shows whether the app is on a LAN direct connection, a direct connection, or Cloudflare.
+
+- Direct connections are on by default. Turn off **Allow direct phone connections (P2P)** under **Phone connection → Away from home** to disable them. Only paired phones can use them, with exactly the same authorization and features as through Cloudflare.
+- Paired phones can see this computer's LAN and public IP addresses.
+- The connection details are exchanged through the Cloudflare gateway; cc-haha runs no relay server of its own. The data channel is encrypted by WebRTC (DTLS).
+- To find a working public path, the computer and the phone ask the public STUN servers of Cloudflare (`stun.cloudflare.com`), Xiaomi (`stun.miwifi.com`), and Google (`stun.l.google.com`) for their own public addresses. These servers can see both ends' public IP addresses, but none of the session content. Turn direct connections off if you do not want that.
+- The status line under the switch shows how direct connections stand on the computer's side: **Direct connections are off** means the switch is off or remote connection is not turned on; **Preparing direct connections** means the direct-connection component is starting, which it does whenever the remote connection turns on or reconnects; **Direct connections are ready** means phones can switch to a direct connection at any time; **Direct connections could not start** means the computer's direct-connection component failed to start or stopped unexpectedly. It retries on its own and pauses after several failures in a row until the remote connection is turned on again or reconnects. Meanwhile phones keep working through Cloudflare.
+- Browsers always go through Cloudflare. Direct connections need a phone app version that includes the direct-connection module; older versions keep working through Cloudflare.
+
+When you come back to the app after it was in the background, the phone was locked, or the network changed, it first checks whether the existing connection still works and keeps using it if so. If it dropped, the app picks the conversation up where it left off and receives only what it missed, without reloading the whole history, and a drop of a few seconds shows no warning. The computer keeps a disconnected phone's recent output for about 3 minutes, during which the session is not treated as closed; after that the app resyncs, again reading only what is new.
 
 ### Pairing, turning off, and restoring
 

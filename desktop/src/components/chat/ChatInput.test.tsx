@@ -469,6 +469,29 @@ describe('ChatInput file mentions', () => {
     expect(screen.queryByTestId('diff-comment-card')).not.toBeInTheDocument()
   })
 
+  it('holds a long run of selected-text references in a capped tray above the editor (#1838)', () => {
+    act(() => {
+      for (let index = 0; index < 20; index += 1) {
+        useWorkspaceChatContextStore.getState().addReference(sessionId, {
+          kind: 'chat-selection',
+          path: 'chat://assistant/reply-1',
+          name: 'AI reply',
+          quote: `selected passage ${index}`,
+          sourceRole: 'assistant',
+          messageId: 'reply-1',
+        })
+      }
+    })
+
+    render(<ChatInput />)
+
+    const tray = within(screen.getByTestId('chat-input-panel')).getByTestId('composer-attachment-tray')
+    expect(within(tray).getAllByRole('button', { name: 'Remove AI reply' })).toHaveLength(20)
+    expect(tray.className).toMatch(/(^|\s)max-h-\[/)
+    expect(tray).toHaveClass('overflow-y-auto')
+    expect(tray).not.toContainElement(screen.getByRole('textbox'))
+  })
+
   it('keeps unsent composer drafts isolated when switching between session tabs', async () => {
     const historySessionId = 'history-session'
     useTabStore.setState({
@@ -3991,6 +4014,106 @@ describe('ChatInput file mentions', () => {
     }
   })
 
+  describe('prompt suggestions', () => {
+    const ghost = () => getComposerElement().querySelector('[data-prompt-suggestion]')
+
+    function offerSuggestion(suggestion: string) {
+      act(() => {
+        useSettingsStore.setState({ nextPromptSuggestionsEnabled: true })
+        useChatStore.getState().handleServerMessage(sessionId, { type: 'prompt_suggestion', suggestion })
+      })
+    }
+
+    beforeEach(() => {
+      useSettingsStore.setState({ chatSendBehavior: 'enter' })
+    })
+
+    afterEach(() => {
+      useSettingsStore.setState({ nextPromptSuggestionsEnabled: false })
+    })
+
+    it('shows the predicted prompt as ghost text and Tab fills the draft without sending it', () => {
+      render(<ChatInput />)
+      offerSuggestion('run the tests')
+
+      expect(ghost()).toHaveTextContent('run the tests')
+      expect(ghost()?.querySelector('kbd')).toHaveTextContent('Tab')
+      expect(ghost()).toHaveAttribute('aria-hidden', 'true')
+      // The ghost takes the placeholder's line instead of overlapping it.
+      expect(getComposerElement()).toHaveAttribute('data-placeholder', '')
+
+      fireEvent.keyDown(getComposerElement(), { key: 'Tab' })
+
+      expect(getComposerText()).toBe('run the tests')
+      expect(ghost()).toBeNull()
+      expect(mocks.wsSend).not.toHaveBeenCalled()
+
+      fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+      expect(mocks.wsSend).toHaveBeenCalledWith(sessionId, {
+        type: 'user_message',
+        content: 'run the tests',
+        attachments: [],
+      })
+      expect(useChatStore.getState().sessions[sessionId]?.promptSuggestion).toBeNull()
+    })
+
+    it('accepts with ArrowRight, hides while typing, comes back on an empty draft, and Esc dismisses it', () => {
+      render(<ChatInput />)
+      offerSuggestion('commit this')
+
+      fireEvent.keyDown(getComposerElement(), { key: 'ArrowRight' })
+      expect(getComposerText()).toBe('commit this')
+      expect(ghost()).toBeNull()
+
+      setComposerText('')
+      expect(ghost()).toHaveTextContent('commit this')
+      setComposerText('n')
+      expect(ghost()).toBeNull()
+      // Tab on a non-empty draft is not an accept.
+      fireEvent.keyDown(getComposerElement(), { key: 'Tab' })
+      expect(getComposerText()).toBe('n')
+      setComposerText('')
+      expect(ghost()).toHaveTextContent('commit this')
+
+      fireEvent.keyDown(getComposerElement(), { key: 'Escape' })
+      expect(ghost()).toBeNull()
+      expect(useChatStore.getState().sessions[sessionId]?.promptSuggestion).toBeNull()
+      fireEvent.keyDown(getComposerElement(), { key: 'Tab' })
+      expect(getComposerText()).toBe('')
+      expect(mocks.wsSend).not.toHaveBeenCalled()
+    })
+
+    it('never sends the suggestion from Enter on an empty draft', () => {
+      render(<ChatInput />)
+      offerSuggestion('push it')
+
+      fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+
+      expect(mocks.wsSend).not.toHaveBeenCalled()
+      expect(getComposerText()).toBe('')
+      expect(ghost()).toHaveTextContent('push it')
+    })
+
+    it('stays hidden while the setting is off, a modifier is held, or the composer tools menu owns Tab', () => {
+      render(<ChatInput />)
+      offerSuggestion('run the tests')
+      act(() => useSettingsStore.setState({ nextPromptSuggestionsEnabled: false }))
+      expect(ghost()).toBeNull()
+      fireEvent.keyDown(getComposerElement(), { key: 'Tab' })
+      expect(getComposerText()).toBe('')
+
+      act(() => useSettingsStore.setState({ nextPromptSuggestionsEnabled: true }))
+      expect(ghost()).toHaveTextContent('run the tests')
+      fireEvent.keyDown(getComposerElement(), { key: 'Tab', shiftKey: true })
+      expect(getComposerText()).toBe('')
+
+      fireEvent.click(screen.getByLabelText('Open composer tools'))
+      expect(ghost()).toBeNull()
+      fireEvent.keyDown(getComposerElement(), { key: 'Tab' })
+      expect(getComposerText()).toBe('')
+    })
+  })
+
   describe('voice input', () => {
     let finishTranscription: (text: string) => void
     const recording = () => ({
@@ -4050,6 +4173,30 @@ describe('ChatInput file mentions', () => {
       expect(model).toBeGreaterThanOrEqual(0)
       expect(voice).toBe(model + 1)
       expect(trailing.lastElementChild).toBe(screen.getByRole('button', { name: 'Run' }))
+    })
+
+    it('hides the predicted prompt while recording so Tab cannot mix it into the transcript', async () => {
+      const ghost = () => getComposerElement().querySelector('[data-prompt-suggestion]')
+      render(<ChatInput />)
+      act(() => {
+        useSettingsStore.setState({ nextPromptSuggestionsEnabled: true })
+        useChatStore.getState().handleServerMessage(sessionId, { type: 'prompt_suggestion', suggestion: '跑一下测试' })
+      })
+      try {
+        expect(ghost()).not.toBeNull()
+
+        await act(async () => {
+          fireEvent.click(screen.getByRole('button', { name: /^Dictate( \(.+\))?$/ }))
+        })
+        expect(ghost()).toBeNull()
+        fireEvent.keyDown(getComposerElement(), { key: 'Tab' })
+        expect(getComposerText()).toBe('')
+
+        fireEvent.click(screen.getByRole('button', { name: 'Cancel recording (Esc)' }))
+        expect(ghost()).not.toBeNull()
+      } finally {
+        useSettingsStore.setState({ nextPromptSuggestionsEnabled: false })
+      }
     })
 
     it('does not render the microphone until dictation is ready', () => {

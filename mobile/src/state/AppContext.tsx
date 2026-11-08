@@ -5,12 +5,18 @@ import React, {
   useMemo,
   useState,
 } from 'react'
-import { Platform } from 'react-native'
+import { AppState, Platform } from 'react-native'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as SecureStore from 'expo-secure-store'
+import { getRandomBytes } from 'expo-crypto'
+import CCHahaDuty from '../../modules/cchaha-duty'
 import { Drafts, HostRepository, type Registry, type Storage } from './storage'
 import { PushRegistrationCoordinator } from './pushRegistrations'
+import { PushTokens } from './pushProvider'
+import { BackgroundDuty } from './backgroundDuty'
+import { getDevicePushToken, getExpoPushToken } from './devicePushToken'
 import { createApiClient } from './api'
+import { hostLinks } from '../core/hostLink'
 import type { Host } from '../core/types'
 import { h5CredentialValue, resolveH5Session, type H5Storage } from '../core/h5Session'
 import { h5Location, isH5 } from './h5'
@@ -36,6 +42,15 @@ const secrets: Storage =
 const repository = new HostRepository(AsyncStorage, secrets)
 const storedCredential = async (id: string) => (await repository.credential(id)) || null
 export const pushRegistrations = new PushRegistrationCoordinator(secrets)
+export const pushTokens = new PushTokens(secrets, {
+  random: getRandomBytes,
+  device: getDevicePushToken,
+  expo: getExpoPushToken,
+})
+/** The Android foreground service that pulls alerts from computers registered via `desktop`. */
+export const backgroundDuty = new BackgroundDuty(
+  Platform.OS === 'android' ? CCHahaDuty : null
+)
 type AppContextValue = {
   registry: Registry
   ready: boolean
@@ -69,6 +84,22 @@ function NativeAppProvider({ children }: React.PropsWithChildren) {
       .catch((e) => setError(e.message))
       .finally(() => setReady(true))
   }, [])
+  useEffect(() => {
+    // The background service mutes its alerts while the app itself is on screen,
+    // and can only (re)start from the foreground.
+    backgroundDuty.setAppActive(AppState.currentState === 'active')
+    const listener = AppState.addEventListener('change', (state) =>
+      backgroundDuty.setAppActive(state === 'active')
+    )
+    return () => listener.remove()
+  }, [])
+  useEffect(() => {
+    if (!ready || error) return
+    backgroundDuty.retain(registry.hosts.map((host) => host.id))
+    // A removed computer's direct-connection link must stop signaling on every
+    // foreground and network change.
+    hostLinks.retain(registry.hosts.map((host) => host.id))
+  }, [ready, error, registry.hosts])
   return (
     <Context.Provider
       value={{
@@ -87,11 +118,17 @@ function NativeAppProvider({ children }: React.PropsWithChildren) {
           if (!host) return
           const credential = await repository.credential(id)
           const client = credential ? createApiClient(host, credential) : null
+          // Not on unmount: Android unmounts React when the activity goes away,
+          // exactly when the background connection has to keep running.
+          backgroundDuty.set(id, undefined)
+          void pushTokens.forget(id).catch(() => {})
           setRegistry(
             await pushRegistrations.removeHost(id, client, () =>
               repository.remove(id)
             )
           )
+          // The unregister request above may have created this computer's link.
+          hostLinks.forget(id)
           drafts.removeHost(id)
         },
       }}
@@ -175,44 +212,80 @@ export function useConnection(id?: string) {
   const host = registry.hosts.find(
     (item) => item.id === (id ?? registry.selectedId)
   )
-  const [auth, setAuth] = useState<{ id: string; credential: string } | null>(
-    null
-  )
-  const [failure, setFailure] = useState<{
-    id: string
+  const [restored, setRestored] = useState<{
+    host: Host
+    credential: string | null
+    issue: 'missing' | 'unavailable' | null
     message: string
   } | null>(null)
+  // Forget the previous selection before rendering any new host-bound client.
+  if (restored && restored.host !== host) setRestored(null)
   useEffect(() => {
+    if (!host) return
     let alive = true
-    if (host)
-      credentialOf(host.id)
-        .then((credential) => {
-          if (!alive) return
-          if (credential === null)
-            setFailure({
-              id: host.id,
-              message: '连接凭据已失效，请在主机页面移除后重新连接',
-            })
-          else setAuth({ id: host.id, credential })
+    let active = AppState.currentState === 'active'
+    let resolved = false
+    let generation = 0
+    let retries = 0
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const restore = async () => {
+      if (!alive || !active || resolved) return
+      const attempt = ++generation
+      const current = () => alive && active && attempt === generation
+      try {
+        const credential = await credentialOf(host.id)
+        if (!current()) return
+        resolved = credential !== null
+        setRestored({
+          host,
+          credential,
+          issue: credential === null ? 'missing' : null,
+          message: credential === null ? '未找到这台电脑的连接凭据，请检查手机上的连接设置' : '',
         })
-        .catch((e) => {
-          if (alive) setFailure({ id: host.id, message: e.message })
+      } catch {
+        if (!current()) return
+        // A locked/unavailable secret store says nothing about server authorization.
+        setRestored({
+          host,
+          credential: null,
+          issue: 'unavailable',
+          message: '暂时无法读取连接凭据，请解锁手机后重试',
         })
+        const delay = [1000, 3000, 10000][retries++]
+        if (delay !== undefined) timer = setTimeout(() => void restore(), delay)
+      }
+    }
+    const listener = AppState.addEventListener('change', (state) => {
+      const next = state === 'active'
+      if (active === next) return
+      active = next
+      generation++
+      clearTimeout(timer)
+      if (active) {
+        retries = 0
+        void restore()
+      }
+    })
+    void restore()
     return () => {
       alive = false
+      clearTimeout(timer)
+      listener.remove()
     }
   }, [host, credentialOf])
+  const current = restored?.host === host ? restored : null
   const client = useMemo(
     () =>
-      host && auth?.id === host.id
-        ? createApiClient(host, auth.credential)
+      host && current?.credential !== null && current?.credential !== undefined
+        ? createApiClient(host, current.credential)
         : null,
-    [host, auth]
+    [host, current]
   )
   return {
     host,
     client,
-    credential: auth?.id === host?.id ? auth?.credential : undefined,
-    error: failure?.id === host?.id ? (failure?.message ?? '') : '',
+    credential: current?.credential ?? undefined,
+    error: current?.message ?? '',
+    credentialIssue: current?.issue ?? null,
   }
 }
